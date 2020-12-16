@@ -20,7 +20,7 @@ end
 function resize(h::Hamiltonian, θ::AbstractVecOrMat{T}) where {T<:AbstractFloat}
     metric = h.metric
     if size(metric) != size(θ)
-        metric = typeof(metric)(size(θ))
+        metric = getname(typeof(metric))(size(θ))
         h = reconstruct(h, metric=metric)
     end
     return h
@@ -207,4 +207,90 @@ function sample(
         @info "Finished $n_samples sampling steps for $n_chains chains in $time (s)" h τ EBFMI_est average_acceptance_rate
     end
     return θs, stats
+end
+
+sample_metric(
+    h::Hamiltonian,
+    τ::AbstractProposal,
+    θ::AbstractVecOrMat{<:AbstractFloat},
+    n_samples::Int,
+    adaptor::AbstractAdaptor=NoAdaptation(),
+    n_adapts::Int=min(div(n_samples, 10), 1_000);
+    drop_warmup=false,
+    verbose::Bool=true,
+    progress::Bool=false,
+    (pm_next!)::Function=pm_next!
+) = sample_metric(
+    GLOBAL_RNG,
+    h,
+    τ,
+    θ,
+    n_samples,
+    adaptor,
+    n_adapts;
+    drop_warmup=drop_warmup,
+    verbose=verbose,
+    progress=progress,
+    (pm_next!)=pm_next!,
+)
+
+"""
+Same as sample but returns the final hamiltonian mass matrix as well.
+"""
+function sample_metric(
+    rng::Union{AbstractRNG, AbstractVector{<:AbstractRNG}},
+    h::Hamiltonian,
+    τ::AbstractProposal,
+    θ::T,
+    n_samples::Int,
+    adaptor::AbstractAdaptor=NoAdaptation(),
+    n_adapts::Int=min(div(n_samples, 10), 1_000);
+    drop_warmup=false,
+    verbose::Bool=true,
+    progress::Bool=false,
+    (pm_next!)::Function=pm_next!
+) where {T<:AbstractVecOrMat{<:AbstractFloat}}
+    @assert !(drop_warmup && (adaptor isa Adaptation.NoAdaptation)) "Cannot drop warmup samples if there is no adaptation phase."
+    # Prepare containers to store sampling results
+    n_keep = n_samples - (drop_warmup ? n_adapts : 0)
+    θs, stats = Vector{T}(undef, n_keep), Vector{NamedTuple}(undef, n_keep)
+    # Initial sampling
+    h, t = sample_init(rng, h, θ)
+    # Progress meter
+    pm = progress ? ProgressMeter.Progress(n_samples, desc="Sampling", barlen=31) : nothing
+    time = @elapsed for i = 1:n_samples
+        # Make a step
+        t = step(rng, h, τ, t.z)
+        # Adapt h and τ; what mutable is the adaptor
+        tstat = stat(t)
+        h, τ, isadapted = adapt!(h, τ, adaptor, i, n_adapts, t.z.θ, tstat.acceptance_rate)
+        tstat = merge(tstat, (is_adapt=isadapted,))
+        # Update progress meter
+        if progress
+            # Do include current iteration and mass matrix
+            pm_next!(pm, (iterations=i, tstat..., mass_matrix=h.metric))
+        # Report finish of adapation
+        elseif verbose && isadapted && i == n_adapts
+            @info "Finished $n_adapts adapation steps" adaptor τ.integrator h.metric
+        end
+        # Store sample
+        if !drop_warmup || i > n_adapts
+            j = i - drop_warmup * n_adapts
+            θs[j], stats[j] = t.z.θ, tstat
+        end
+    end
+    # Report end of sampling
+    if verbose
+        EBFMI_est = EBFMI(map(s -> s.hamiltonian_energy, stats))
+        average_acceptance_rate = mean(map(s -> s.acceptance_rate, stats))
+        if θ isa AbstractVector
+            n_chains = 1
+        else
+            n_chains = size(θ, 2)
+            EBFMI_est = "[" * join(EBFMI_est, ", ") * "]"
+            average_acceptance_rate = "[" * join(average_acceptance_rate, ", ") * "]"
+        end
+        @info "Finished $n_samples sampling steps for $n_chains chains in $time (s)" h τ EBFMI_est average_acceptance_rate
+    end
+    return θs, stats, h.metric
 end

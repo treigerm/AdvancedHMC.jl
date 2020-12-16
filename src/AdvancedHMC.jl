@@ -82,7 +82,7 @@ export StepSizeAdaptor, NesterovDualAveraging,
 include("diagnosis.jl")
 
 include("sampler.jl")
-export sample
+export sample, sample_metric
 
 include("contrib/ad.jl")
 
